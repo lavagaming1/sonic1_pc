@@ -1,3 +1,4 @@
+#include "win_shim.h"
 #include "data.h"
 #include "assets.h"
 #include "palette.h"
