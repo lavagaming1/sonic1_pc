@@ -2435,7 +2435,6 @@ static void Sonic_MdJump2(void *obj) {
     Sonic_JumpAngle(o);
     Sonic_Floor(o);
 }
-
 static void Sonic_MoveLeft(void *obj) {
     uint8_t *o = (uint8_t *)obj;
     int16_t d0 = obInertia(o);
@@ -2460,36 +2459,42 @@ static void Sonic_MoveLeft(void *obj) {
                 goto nostopping;
             }
             obAnim(o) = id_Stop;
-            obStatus(o) &= ~(1 << 0);
+            obStatus(o) &= ~(1 << 0); /* Clear flip flag (faces right while skidding left) */
             Sound_Queue(sfx_Skid, false);
         }
         goto nostopping;
     }
 
-    /* .still: bset #0,obStatus → Z = valor ANTERIOR de bit 0.
-     *      bne .alreadyleft  ⇔  ya estaba flipeado antes. */
-    {
-        uint8_t wasFlipped = obStatus(o) & (1 << 0);
-        obStatus(o) |= (1 << 0);
-        if (!wasFlipped) {
-            obStatus(o) &= ~(1 << 5);
-            obPrevAni(o) = id_Run;
-        }
+    /* .still / .alreadyleft: set facing-left bit (bit 0) */
+    uint8_t wasFacingLeft = obStatus(o) & (1 << 0);
+    obStatus(o) |= (1 << 0);
+    if (!wasFacingLeft) {
+        obStatus(o) &= ~(1 << 5); /* Clear pushing flag */
+        obPrevAni(o) = id_Run;
     }
 
-    d0 = d0 - d5;
-    {
-        int16_t d1 = -d6;
-        /* bgt.s .nocap: salta el cap si d0 > -max.
-         *          Es decir, cap sólo cuando d0 <= -max. */
-        if (d0 <= d1) {
+    /* Subtract acceleration (leftward movement uses negative velocity) */
+    d0 -= d5;
+
+    /* Speed Cap Check (with smooth high-speed preservation patch) */
+    int16_t d1 = -d6; /* Max leftward speed (e.g., -0x0600) */
+
+    if (d0 <= d1) {
+        if (d0 + d5 <= d1) {
+            /* Speed was ALREADY <= max left speed before acceleration:
+             * Revert this frame's acceleration change and retain high speed */
+            d0 += d5;
+        } else {
+            /* Speed just exceeded max left speed this frame: cap at max speed */
             d0 = d1;
         }
     }
+
+/* .nocap */
     obInertia(o) = d0;
     obAnim(o) = id_Walk;
 
-    nostopping:
+nostopping:
     return;
 }
 
@@ -2523,25 +2528,34 @@ static void Sonic_MoveRight(void *obj) {
         goto nostopping;
     }
 
-    /* .alreadyright: bclr #0,obStatus → Z = valor ANTERIOR de bit 0.
-     *      beq .alreadyright ⇔ ya estaba a 0 (ya miraba a la derecha). */
-    {
-        uint8_t wasFlipped = obStatus(o) & (1 << 0);
-        obStatus(o) &= ~(1 << 0);
-        if (wasFlipped) {
-            obStatus(o) &= ~(1 << 5);
-            obPrevAni(o) = id_Run;
+    /* .alreadyright: clear direction flip flags */
+    uint8_t wasFlipped = obStatus(o) & (1 << 0);
+    obStatus(o) &= ~(1 << 0);
+    if (wasFlipped) {
+        obStatus(o) &= ~(1 << 5);
+        obPrevAni(o) = id_Run;
+    }
+
+    /* Add acceleration */
+    d0 += d5;
+
+    /* Speed Cap Check (with smooth high-speed preservation patch) */
+    if (d0 >= d6) {
+        if (d0 - d5 >= d6) {
+            /* Speed was ALREADY >= max speed before acceleration:
+             * Revert this frame's acceleration change and retain high speed */
+            d0 -= d5;
+        } else {
+            /* Speed just exceeded max speed this frame: cap at max speed */
+            d0 = d6;
         }
     }
 
-    d0 = d0 + d5;
-    if (d0 > d6) {
-        d0 = d6;
-    }
+/* .nocap */
     obInertia(o) = d0;
     obAnim(o) = id_Walk;
 
-    nostopping:
+nostopping:
     return;
 }
 
@@ -2771,35 +2785,53 @@ static void Sonic_JumpHeight(void *obj) {
 static void Sonic_JumpDirection(void *obj) {
     uint8_t *o = (uint8_t *)obj;
     int16_t d6 = v_sonspeedmax;
-    int16_t d5 = v_sonspeedacc * 2;
+    int16_t d5 = v_sonspeedacc << 1; /* Air acceleration is doubled (asl.w #1) */
 
+    /* Check Roll-Jump flag (bit 4 of obStatus).
+     * If set, midair direction changes are locked. */
     if (obStatus(o) & (1 << 4)) {
-        Sonic_RollJumpLock(o);
-        return;
+        return; /* Sonic_RollJumpLock */
     }
-    {
-        int16_t d0 = obVelX(o);
-        if (v_jpadhold2 & btnL) {
-            obStatus(o) |= (1 << 0);
-            d0 = d0 - d5;
-            {
-                int16_t d1 = -d6;
-                if (d0 <= d1) {
-                    d0 = d1;
-                }
+
+    int16_t d0 = obVelX(o); /* Midair physics modify horizontal velocity (obVelX), not inertia */
+
+    /* Check Left Input */
+    if (v_jpadhold2 & (1 << bitL)) {
+        obStatus(o) |= (1 << 0); /* Set X-flip flag (facing left) */
+        d0 -= d5;
+
+        int16_t d1 = -d6; /* Max leftward air speed */
+        if (d0 <= d1) {
+            if (d0 + d5 <= d1) {
+                /* Speed was ALREADY <= max left speed: retain high speed */
+                d0 += d5;
+            } else {
+                /* Cap leftward X-speed to maximum */
+                d0 = d1;
             }
         }
-        if (v_jpadhold2 & btnR) {
-            obStatus(o) &= ~(1 << 0);
-            d0 = d0 + d5;
-            if (d0 >= d6) {
+    }
+
+    /* .notleft: Check Right Input */
+    if (v_jpadhold2 & (1 << bitR)) {
+        obStatus(o) &= ~(1 << 0); /* Clear X-flip flag (facing right) */
+        d0 += d5;
+
+        if (d0 >= d6) {
+            if (d0 - d5 >= d6) {
+                /* Speed was ALREADY >= max right speed: retain high speed */
+                d0 -= d5;
+            } else {
+                /* Cap rightward X-speed to maximum */
                 d0 = d6;
             }
         }
-        obVelX(o) = d0;
     }
-    Sonic_RollJumpLock(o);
+
+/* Sonic_JumpMove */
+    obVelX(o) = d0;
 }
+
 
 static void Sonic_RollJumpLock(void *obj) {
     uint8_t *o = (uint8_t *)obj;
